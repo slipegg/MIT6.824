@@ -1,0 +1,2 @@
+# # 包含全局.gitignore的规则
+!/.gitignore_global

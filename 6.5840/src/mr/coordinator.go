@@ -43,14 +43,6 @@ type reportMsg struct {
 	ok      chan struct{}
 }
 
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
-	return nil
-}
-
 func (c *Coordinator) Heartbeat(request *HeartbeatRequest, response *HeartbeatResponse) error {
 	msg := heartbeatMsg{response, make(chan struct{})}
 	c.heartbeatCh <- msg
@@ -95,6 +87,7 @@ func (c *Coordinator) initCompletePhase() {
 
 func (c *Coordinator) schedule() {
 	c.initMapPhase()
+
 	for {
 		select {
 		case msg := <-c.heartbeatCh:
@@ -103,16 +96,62 @@ func (c *Coordinator) schedule() {
 				c.switchPhase()
 				c.selectTaskAfterSwitchPhase(msg.response)
 			}
-
 			log.Printf("Coordinator: Heartbeat response: %v\n", msg.response)
 			msg.ok <- struct{}{}
+
 		case msg := <-c.reportCh:
 			if msg.request.Phase == c.phase {
-				log.Printf("Coordinator: Work has finished task%d\n", msg.request.Id)
+				log.Printf("Coordinator: Worker has finished %v-task%d\n", c.phase, msg.request.Id)
 				c.tasks[msg.request.Id].status = Finished
 			}
 			msg.ok <- struct{}{}
 		}
+	}
+}
+
+func (c *Coordinator) selectANewTask(response *HeartbeatResponse) bool {
+	isAllTaskDone, isNewTaskScheduled := true, false
+
+	for id, task := range c.tasks {
+		switch task.status {
+		case Idle:
+			isAllTaskDone, isNewTaskScheduled = false, true
+			c.tasks[id].status, c.tasks[id].startTime = Working, time.Now()
+			c.scheduleTaskToResponse(id, response)
+
+		case Working:
+			isAllTaskDone = false
+			if time.Since(task.startTime) > MaxTaskRunInterval {
+				isNewTaskScheduled = true
+				c.tasks[id].startTime = time.Now()
+				c.scheduleTaskToResponse(id, response)
+			}
+
+		case Finished:
+		}
+
+		if isNewTaskScheduled {
+			break
+		}
+	}
+
+	if !isNewTaskScheduled && !isAllTaskDone {
+		response.JobType = WaitJob
+	}
+
+	return isAllTaskDone
+}
+
+func (c *Coordinator) scheduleTaskToResponse(taskId int, response *HeartbeatResponse) {
+	response.Id = taskId
+	response.NReduce = c.nReduce
+	switch c.phase {
+	case MapPhase:
+		response.JobType = MapJob
+		response.FilePath = c.tasks[taskId].filePath
+	case ReducePhase:
+		response.JobType = ReduceJob
+		response.NMap = c.nMap
 	}
 }
 
@@ -144,63 +183,6 @@ func (c *Coordinator) selectTaskAfterSwitchPhase(response *HeartbeatResponse) {
 	}
 }
 
-func (c *Coordinator) selectANewTask(response *HeartbeatResponse) bool {
-	isAllTaskDone, isNewTaskScheduled := true, false
-
-	for id, task := range c.tasks {
-		switch task.status {
-		case Idle:
-			isAllTaskDone, isNewTaskScheduled = false, true
-			c.tasks[id].status, c.tasks[id].startTime = Working, time.Now()
-			c.scheduleTaskToResponse(id, response)
-		case Working:
-			isAllTaskDone = false
-			if time.Since(task.startTime) > MaxTaskRunInterval {
-				isNewTaskScheduled = true
-				c.tasks[id].startTime = time.Now()
-				c.scheduleTaskToResponse(id, response)
-			}
-		case Finished:
-		}
-
-		if isNewTaskScheduled {
-			break
-		}
-	}
-
-	if !isNewTaskScheduled && !isAllTaskDone {
-		response.JobType = WaitJob
-	}
-
-	return isAllTaskDone
-}
-
-func (c *Coordinator) scheduleTaskToResponse(taskId int, response *HeartbeatResponse) {
-	response.Id = taskId
-	response.NReduce = c.nReduce
-	switch c.phase {
-	case MapPhase:
-		response.JobType = MapJob
-		response.FilePath = c.tasks[taskId].filePath
-	case ReducePhase:
-		response.JobType = ReduceJob
-		response.NMap = c.nMap
-	}
-}
-
-func (c *Coordinator) getJobTypeByPhase() JobType {
-	switch c.phase {
-	case MapPhase:
-		return MapJob
-	case ReducePhase:
-		return ReduceJob
-	case CompletePhase:
-		return CompleteJob
-	default:
-		return WaitJob
-	}
-}
-
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server() {
 	rpc.Register(c)
@@ -218,18 +200,15 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
-
-	// Your code here.
-
-	return ret
+	<-c.doneCh
+	log.Printf("Coordinator: Done\n")
+	return true
 }
 
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	// Your code here.
 	c := Coordinator{
 		files:       files,
 		nReduce:     nReduce,

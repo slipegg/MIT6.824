@@ -32,13 +32,10 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
 	for {
 		response := doHeartbeat()
-		log.Printf("Worker: receive coordinator's heartbeat %v \n", response)
+		log.Printf("Worker: receive coordinator's response, new job is %v \n", response)
+
 		switch response.JobType {
 		case MapJob:
 			doMapTask(mapf, response)
@@ -49,7 +46,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		case CompleteJob:
 			return
 		default:
-			panic(fmt.Sprintf("unexpected jobType %v", response.JobType))
+			panic(fmt.Sprintf("worker get an unexpected jobType %v", response.JobType))
 		}
 	}
 
@@ -71,6 +68,48 @@ func doMapTask(mapF func(string, string) []KeyValue, response *HeartbeatResponse
 	writeIntermediateFilewg.Wait()
 
 	doReport(response.Id, MapPhase)
+}
+
+func getWordCountListOfFile(mapF func(string, string) []KeyValue, filePath string) []KeyValue {
+	file, err := os.Open(filePath)
+	defer file.Close()
+	if err != nil {
+		log.Fatalf("cannot open %v", filePath)
+	}
+	content, err := io.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filePath)
+	}
+	return mapF(filePath, string(content))
+}
+
+func splitWordCountListToReduceNNum(wordCountList []KeyValue, nReduce int) [][]KeyValue {
+	intermediate := make([][]KeyValue, nReduce)
+	for _, wordCount := range wordCountList {
+		word := wordCount.Key
+		reduceNumber := ihash(word) % nReduce
+		intermediate[reduceNumber] = append(intermediate[reduceNumber], wordCount)
+	}
+	return intermediate
+}
+
+func writeIntermediateFile(mapNumber int, reduceNumber int, wordCountList []KeyValue) {
+	fileName := generateMapResultFileName(mapNumber, reduceNumber)
+	file, err := os.Create(fileName)
+	defer file.Close()
+	if err != nil {
+		log.Fatalf("cannot create %v", fileName)
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	for _, wordCount := range wordCountList {
+		err := enc.Encode(&wordCount)
+		if err != nil {
+			log.Fatalf("cannot encode %v", wordCount)
+		}
+	}
+	atomicWriteFile(fileName, &buf)
 }
 
 func doReduceTask(reduceF func(string, []string) string, response *HeartbeatResponse) {
@@ -138,52 +177,6 @@ func decodeWordCountListFromIntermediateFile(mapNumber int, reduceNumer int) []K
 	return wordCountList
 }
 
-func doReport(id int, phase SchedulePhase) {
-	call("Coordinator.Report", &ReportRequest{Id: id, Phase: phase}, &ReportResponse{})
-}
-
-func getWordCountListOfFile(mapF func(string, string) []KeyValue, filePath string) []KeyValue {
-	file, err := os.Open(filePath)
-	defer file.Close()
-	if err != nil {
-		log.Fatalf("cannot open %v", filePath)
-	}
-	content, err := io.ReadAll(file)
-	if err != nil {
-		log.Fatalf("cannot read %v", filePath)
-	}
-	return mapF(filePath, string(content))
-}
-
-func splitWordCountListToReduceNNum(wordCountList []KeyValue, nReduce int) [][]KeyValue {
-	intermediate := make([][]KeyValue, nReduce)
-	for _, wordCount := range wordCountList {
-		word := wordCount.Key
-		reduceNumber := ihash(word) % nReduce
-		intermediate[reduceNumber] = append(intermediate[reduceNumber], wordCount)
-	}
-	return intermediate
-}
-
-func writeIntermediateFile(mapNumber int, reduceNumber int, wordCountList []KeyValue) {
-	fileName := generateMapResultFileName(mapNumber, reduceNumber)
-	file, err := os.Create(fileName)
-	defer file.Close()
-	if err != nil {
-		log.Fatalf("cannot create %v", fileName)
-	}
-
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	for _, wordCount := range wordCountList {
-		err := enc.Encode(&wordCount)
-		if err != nil {
-			log.Fatalf("cannot encode %v", wordCount)
-		}
-	}
-	atomicWriteFile(fileName, &buf)
-}
-
 func atomicWriteFile(filename string, reader io.Reader) (err error) {
 	tmpFileName, err := writeToTmpFile(filename, reader)
 	if err != nil {
@@ -227,35 +220,16 @@ func writeToTmpFile(filename string, reader io.Reader) (tmpFileName string, err 
 
 func doHeartbeat() *HeartbeatResponse {
 	response := HeartbeatResponse{}
-	call("Coordinator.Heartbeat", &HeartbeatRequest{}, &response)
+	isSuccess := call("Coordinator.Heartbeat", &HeartbeatRequest{}, &response)
+	if !isSuccess {
+		log.Printf("Worker: call Coordinator.Heartbeat failed, worker will exit.")
+		response.JobType = CompleteJob
+	}
 	return &response
 }
 
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
-	}
+func doReport(id int, phase SchedulePhase) {
+	call("Coordinator.Report", &ReportRequest{Id: id, Phase: phase}, &ReportResponse{})
 }
 
 // send an RPC request to the coordinator, wait for the response.

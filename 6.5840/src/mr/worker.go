@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -41,11 +42,10 @@ func Worker(mapf func(string, string) []KeyValue,
 		switch response.JobType {
 		case MapJob:
 			doMapTask(mapf, response)
-			return
 		case ReduceJob:
-			fmt.Print("get a reduceJob\n")
+			doReduceTask(reducef, response)
 		case WaitJob:
-			fmt.Print("get a waitJob\n")
+			time.Sleep(1 * time.Second)
 		case CompleteJob:
 			return
 		default:
@@ -57,10 +57,8 @@ func Worker(mapf func(string, string) []KeyValue,
 
 func doMapTask(mapF func(string, string) []KeyValue, response *HeartbeatResponse) {
 	wordCountList := getWordCountListOfFile(mapF, response.FilePath)
-	// fmt.Printf("wordCountList: %v\n", wordCountList)
 
 	intermediate := splitWordCountListToReduceNNum(wordCountList, response.NReduce)
-	// fmt.Printf("intermediate: %v\n", intermediate)
 
 	var writeIntermediateFilewg sync.WaitGroup
 	for reduceNumber, splitedWordCountList := range intermediate {
@@ -72,6 +70,72 @@ func doMapTask(mapF func(string, string) []KeyValue, response *HeartbeatResponse
 	}
 	writeIntermediateFilewg.Wait()
 
+	doReport(response.Id, MapPhase)
+}
+
+func doReduceTask(reduceF func(string, []string) string, response *HeartbeatResponse) {
+	wordCountList := getWordCountListFromIntermediateFile(response.NMap, response.Id)
+
+	wordCountMap := gatherAndSortIntermediateWordCountList(wordCountList)
+
+	var buf bytes.Buffer
+	reducIntermediateWordCount(reduceF, wordCountMap, &buf)
+
+	fileName := generateReduceResultFileName(response.Id)
+	atomicWriteFile(fileName, &buf)
+
+	doReport(response.Id, ReducePhase)
+}
+
+func getWordCountListFromIntermediateFile(NMap int, reduceNumer int) []KeyValue {
+	var wordCountList []KeyValue
+	for mapNumber := 0; mapNumber < NMap; mapNumber++ {
+		splitedWordCountList := decodeWordCountListFromIntermediateFile(mapNumber, reduceNumer)
+		wordCountList = append(wordCountList, splitedWordCountList...)
+	}
+
+	return wordCountList
+}
+
+func gatherAndSortIntermediateWordCountList(wordCountList []KeyValue) map[string][]string {
+	wordCountMap := make(map[string][]string)
+	for _, wordCount := range wordCountList {
+		word := wordCount.Key
+		count := wordCount.Value
+		wordCountMap[word] = append(wordCountMap[word], count)
+	}
+
+	return wordCountMap
+}
+
+func reducIntermediateWordCount(reduceF func(string, []string) string, wordCountMap map[string][]string, buf *bytes.Buffer) {
+	for word, counts := range wordCountMap {
+		reduceResult := reduceF(word, counts)
+		fmt.Fprintf(buf, "%v %v\n", word, reduceResult)
+	}
+}
+
+func decodeWordCountListFromIntermediateFile(mapNumber int, reduceNumer int) []KeyValue {
+	filePath := generateMapResultFileName(mapNumber, reduceNumer)
+	file, err := os.Open(filePath)
+	if err != nil {
+		log.Fatalf("cannot open %v", filePath)
+	}
+	defer file.Close()
+
+	var wordCountList []KeyValue
+	dec := json.NewDecoder(file)
+	for {
+		var wordCount KeyValue
+		if err := dec.Decode(&wordCount); err == io.EOF {
+			break
+		} else if err != nil {
+			log.Fatalf("cannot decode %v", filePath)
+		}
+		wordCountList = append(wordCountList, wordCount)
+	}
+
+	return wordCountList
 }
 
 func doReport(id int, phase SchedulePhase) {

@@ -144,9 +144,9 @@ func (c *Coordinator) selectANewTask(response *HeartbeatResponse) bool {
 
 func (c *Coordinator) scheduleTaskToResponse(taskId int, response *HeartbeatResponse) {
 	response.Id = taskId
-	response.NReduce = c.nReduce
 	switch c.phase {
 	case MapPhase:
+		response.NReduce = c.nReduce
 		response.JobType = MapJob
 		response.FilePath = c.tasks[taskId].filePath
 	case ReducePhase:

@@ -101,6 +101,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
+	if me == 0 {
+		Debug(dInfo, "peerNum %v", len(peers))
+	}
 	go rf.ticker()
 
 	return rf
@@ -167,12 +170,14 @@ func (rf *Raft) ticker() {
 		case <-rf.heartbeatTimeout.C:
 			rf.mu.Lock()
 			if rf.state == Leader {
+				Debug(dTimer, "S%d Leader, the heartbeat timer timeout", rf.me)
 				rf.broadcastHeartbeat()
 				rf.heartbeatTimeout.Reset(StableHeartbeatTimeout())
 			}
 			rf.mu.Unlock()
 		case <-rf.electionTimeout.C:
 			rf.mu.Lock()
+			Debug(dTimer, "S%d {state: %v, term: %v}, the election timer timeout", rf.me, rf.state, rf.currentTerm)
 			rf.changeState(Candidate)
 			rf.currentTerm++
 			rf.startElection()
@@ -215,7 +220,7 @@ func RandomizedElectionTimeout() time.Duration {
  */
 func (rf *Raft) startElection() {
 	request := rf.genRequestVoteRequest()
-	DPrintf("{Node %v} starts election with RequestVoteRequest %v", rf.me, request)
+	Debug(dVote, "S%v starts election with RequestVoteRequest %v", rf.me, request)
 	rf.votedFor = rf.me
 	grantedVoteNum := 1
 
@@ -236,7 +241,7 @@ func (rf *Raft) electionRequestOnce(peer int, grantedVoteNum *int, request *Requ
 	if rf.sendRequestVote(peer, request, reply) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		DPrintf("{Node %v} received RequestVoteReply {%v} from {Node %v}", rf.me, reply, peer)
+		Debug(dVote, "S%v received RequestVoteReply {%v} from S%v", rf.me, reply, peer)
 		if rf.currentTerm == request.Term && rf.state == Candidate {
 			if reply.VoteGranted {
 				*grantedVoteNum++
@@ -246,7 +251,7 @@ func (rf *Raft) electionRequestOnce(peer int, grantedVoteNum *int, request *Requ
 				}
 			}
 		} else if reply.Term > rf.currentTerm {
-			DPrintf("{Node %v} found higher term %v in RequestVoteReply %v from {Node %v}", rf.me, reply.Term, reply, peer)
+			Debug(dVote, "S%v found higher term %v in RequestVoteReply %v from S%v", rf.me, reply.Term, reply, peer)
 			rf.currentTerm = reply.Term
 			rf.votedFor = -1
 			rf.changeState(Follower)
@@ -258,7 +263,7 @@ func (rf *Raft) changeState(newState NodeState) {
 	if rf.state == newState {
 		return
 	}
-	DPrintf("{Node %v} changes state from %s to %s", rf.me, rf.state, newState)
+	Debug(dInfo, "S%v changes state from %s to %s", rf.me, rf.state, newState)
 	rf.state = newState
 
 	switch newState {
@@ -292,7 +297,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer DPrintf("{Node %v}'s state is {state: %v, term: %v}, the RequestVoteReply is {%v}", rf.me, rf.state, rf.currentTerm, reply)
+	defer Debug(dVote, "S%v state is {state: %v, term: %v}, the RequestVoteReply is {%v}", rf.me, rf.state, rf.currentTerm, reply)
 
 	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId) {
 		reply.Term, reply.VoteGranted = rf.currentTerm, false
@@ -348,7 +353,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
  * The following code is about the log replication process and the heartbeat broadcast.
  */
 func (rf *Raft) broadcastHeartbeat() {
-	DPrintf("{Node %v} broadcasts heartbeat", rf.me)
+	Debug(dLeader, "S%v broadcasts heartbeat", rf.me)
 	for peer := range rf.peers {
 		if peer != rf.me {
 			go rf.replicateOneRound(peer)
@@ -364,7 +369,7 @@ func (rf *Raft) replicateOneRound(peer int) {
 	request := rf.genAppendEntriesRequest(peer)
 	reply := new(AppendEntriesReply)
 	if rf.sendAppendEntries(peer, request, reply) {
-		DPrintf("{Node %v} received AppendEntriesReply {%v} from {Node %v}", rf.me, reply, peer)
+		Debug(dLeader, "S%v received AppendEntriesReply {%v} from S%v", rf.me, reply, peer)
 	}
 }
 
@@ -379,7 +384,7 @@ func (rf *Raft) handleAppendEntriesResponse(peer int, request *AppendEntriesRequ
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesReply) {
-	DPrintf("{Node %v} received AppendEntriesRequest {%v}", rf.me, args)
+	Debug(dLog, "S%v received AppendEntriesRequest {%v}", rf.me, args)
 	rf.changeState(Follower)
 	rf.electionTimeout.Reset(RandomizedElectionTimeout())
 	reply.Term, reply.Success = rf.currentTerm, true

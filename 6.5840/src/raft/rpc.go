@@ -29,19 +29,25 @@ func (reply RequestVoteReply) String() string {
 }
 
 type AppendEntriesRequest struct {
-	Term     int
-	LeaderId int
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 func (request AppendEntriesRequest) String() string {
-	return fmt.Sprintf("{Term:%v,LeaderId:%v", request.Term, request.LeaderId)
+	return fmt.Sprintf("{Term:%v,LeaderId:%v,PrevLogIndex:%v,PrevLogTerm:%v,Entries:%v,LeaderCommit:%v}", request.Term, request.LeaderId, request.PrevLogIndex, request.PrevLogTerm, request.Entries, request.LeaderCommit)
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term           int
+	Success        bool
+	LastMatchIndex int
+	LastMatchTerm  int
 }
 
 func (reply AppendEntriesReply) String() string {
-	return fmt.Sprintf("{Term:%v,Success:%v", reply.Term, reply.Success)
+	return fmt.Sprintf("{Term:%v,Success:%v,LastMatchIndex:%v,LastMatchTerm:%v}", reply.Term, reply.Success, reply.LastMatchIndex, reply.LastMatchTerm)
 }

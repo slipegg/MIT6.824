@@ -75,6 +75,8 @@ def main(
         try:
             time, topic, *msg = line.strip().split(" ")
             # To ignore some topics
+            if topic not in list(TOPICS):
+                raise Exception("Unknown topic")
             if topic not in topics:
                 continue
 

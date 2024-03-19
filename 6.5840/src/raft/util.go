@@ -94,3 +94,20 @@ func (s NodeState) String() string {
 		return "Unknown"
 	}
 }
+
+type LogEntry struct {
+	Index   int
+	Term    int
+	Command interface{}
+}
+
+func (entry LogEntry) String() string {
+	return fmt.Sprintf("Index: %d, Term: %d, Command: %v", entry.Index, entry.Term, entry.Command)
+}
+
+func Min(x, y int) int {
+	if x < y {
+		return x
+	}
+	return y
+}

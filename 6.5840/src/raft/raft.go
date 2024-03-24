@@ -18,7 +18,7 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 
 	"math/rand"
 	"sort"
@@ -26,7 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -166,6 +166,7 @@ func (rf *Raft) appendNewLog(command interface{}) LogEntry {
 	lastLog := rf.getLastLog()
 	newLog := LogEntry{lastLog.Index + 1, rf.currentTerm, command}
 	rf.logs = append(rf.logs, newLog)
+	rf.persist()
 	rf.matchIndex[rf.me] = newLog.Index
 	rf.nextIndex[rf.me] = newLog.Index + 1
 	return newLog
@@ -221,6 +222,7 @@ func (rf *Raft) ticker() {
 			Debug(dTimer, "S%d {state: %v, term: %v}, the election timer timeout", rf.me, rf.state, rf.currentTerm)
 			rf.changeState(Candidate)
 			rf.currentTerm++
+			rf.persist()
 			rf.startElection()
 			rf.electionTimeout.Reset(RandomizedElectionTimeout())
 			rf.mu.Unlock()
@@ -263,6 +265,7 @@ func (rf *Raft) startElection() {
 	request := rf.genRequestVoteRequest()
 	Debug(dVote, "S%v starts election with RequestVoteRequest %v", rf.me, request)
 	rf.votedFor = rf.me
+	rf.persist()
 	grantedVoteNum := 1
 
 	// Your code here (2A, 2B).
@@ -290,6 +293,7 @@ func (rf *Raft) electionRequestOnce(peer int, grantedVoteNum *int, request *Requ
 			Debug(dVote, "S%v found higher term %v in RequestVoteReply %v from S%v", rf.me, reply.Term, reply, peer)
 			rf.currentTerm = reply.Term
 			rf.votedFor = -1
+			rf.persist()
 			rf.changeState(Follower)
 		}
 	}
@@ -345,6 +349,7 @@ func (rf *Raft) RequestVote(request *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	defer Debug(dVote, "S%v state is {state: %v, term: %v}, the RequestVoteReply is {%v}", rf.me, rf.state, rf.currentTerm, reply)
 
 	if request.Term < rf.currentTerm || (request.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != request.CandidateId) {
@@ -405,7 +410,7 @@ func (rf *Raft) broadcastHeartbeat(isHeartbeat bool) {
 	for peer := range rf.peers {
 		if peer != rf.me {
 			if isHeartbeat {
-				Debug(dLeader, "S%v broadcasts heartbeat", rf.me)
+				Debug(dLeader, "S%v broadcasts heartbeat to S%v", rf.me, peer)
 				go rf.replicateOneRound(peer)
 			} else {
 				rf.replicatorCond[peer].Signal()
@@ -426,6 +431,9 @@ func (rf *Raft) replicateOneRound(peer int) {
 	request := rf.genAppendEntriesRequest(lastSendIndex)
 	rf.mu.RUnlock()
 	reply := new(AppendEntriesReply)
+	if request.Entries != nil && len(request.Entries) > 0 {
+		Debug(dLeader, "S%v sends to S%v with AppendEntriesRequest {%v} ", rf.me, peer, request)
+	}
 	if rf.sendAppendEntries(peer, request, reply) {
 		rf.mu.Lock()
 		rf.handleAppendEntriesResponse(peer, request, reply)
@@ -460,6 +468,7 @@ func (rf *Raft) genAppendEntriesRequest(lastSendIndex int) *AppendEntriesRequest
 }
 
 func (rf *Raft) handleAppendEntriesResponse(peer int, request *AppendEntriesRequest, reply *AppendEntriesReply) {
+	Debug(dLeader, "S%v received from S%v with AppendEntriesReply {%v} and AppendEntriesRequest {%v}", rf.me, peer, reply, request)
 	if rf.state != Leader || request.Term != rf.currentTerm {
 		return
 	}
@@ -468,7 +477,7 @@ func (rf *Raft) handleAppendEntriesResponse(peer int, request *AppendEntriesRequ
 		rf.matchIndex[peer] = request.PrevLogIndex + len(request.Entries)
 		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
 		if request.Entries != nil && len(request.Entries) > 0 {
-			Debug(dLog, "S%v has append log entries(startId: %v, length: %v) to S%v. Now the S%v's nextIndex is %v", rf.me, request.PrevLogIndex+1, len(request.Entries), peer, peer, rf.nextIndex[peer])
+			Debug(dLog, "S%v has replicated log entries(startId: %v, length: %v) to S%v. Now the S%v's nextIndex is %v", rf.me, request.PrevLogIndex+1, len(request.Entries), peer, peer, rf.nextIndex[peer])
 		} else {
 			Debug(dInfo, "S%v has received heartbeat reply from S%v", rf.me, peer)
 		}
@@ -477,20 +486,23 @@ func (rf *Raft) handleAppendEntriesResponse(peer int, request *AppendEntriesRequ
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
 			rf.votedFor = -1
+			rf.persist()
 			Debug(dWarn, "S%v found higher term %v in AppendEntriesReply %v from S%v", rf.me, reply.Term, reply, peer)
 			rf.changeState(Follower)
 		} else if reply.Term == rf.currentTerm {
 			if reply.LastMatchTerm == -1 {
 				rf.nextIndex[peer] = reply.LastMatchIndex + 1
-				Debug(dLog, "S%v failed to append log entries to S%v, because S%v's log is too short. Now the S%v's nextIndex is %v", rf.me, peer, peer, peer, rf.nextIndex[peer])
+				Debug(dLog, "S%v failed to replicate log entries to S%v, because S%v's log is too short. Now the S%v's nextIndex is %v", rf.me, peer, peer, peer, rf.nextIndex[peer])
 			} else {
-				for i := request.PrevLogIndex; i > 0; i-- {
-					if rf.logs[i].Term == reply.LastMatchTerm {
+				rf.nextIndex[peer] = 1
+				for i := reply.LastMatchIndex; i > 0; i-- {
+					if rf.logs[i].Term <= reply.LastMatchTerm {
 						rf.nextIndex[peer] = i + 1
-						Debug(dLog, "S%v failed to append log entries to S%v, because S%v's log(%v) does not match the leader's log(%v). Now the S%v's nextIndex is %v with the same term S%v's log(%v)", rf.me, peer, peer, reply.LastMatchIndex, i, peer, rf.nextIndex[peer], peer, rf.logs[rf.nextIndex[peer]].Term)
 						break
 					}
 				}
+				Debug(dWarn, "S%v failed to replicate log entries to S%v, because of different term in %v log(S%v's term: %v, S%v's term %v). now the S%v's nextIndex is %v",
+					rf.me, peer, request.PrevLogIndex, rf.me, request.PrevLogTerm, peer, reply.LastMatchTerm, peer, rf.nextIndex[peer])
 			}
 		}
 	}
@@ -499,14 +511,18 @@ func (rf *Raft) handleAppendEntriesResponse(peer int, request *AppendEntriesRequ
 func (rf *Raft) AppendEntries(request *AppendEntriesRequest, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	if request.Entries != nil && len(request.Entries) > 0 {
-		Debug(dLog, "S%v received AppendEntriesRequest {%v}", rf.me, request)
+		Debug(dLog, "S%v received from S%v with AppendEntriesRequest {%v}", rf.me, request.LeaderId, request)
 	} else {
 		Debug(dInfo, "S%v received heartbeat from S%v", rf.me, request.LeaderId)
 	}
 	if request.Term < rf.currentTerm {
 		reply.Term, reply.Success = rf.currentTerm, false
 		return
+	}
+	if request.Term > rf.currentTerm {
+		rf.currentTerm, rf.votedFor = request.Term, -1
 	}
 
 	rf.changeState(Follower)
@@ -517,21 +533,37 @@ func (rf *Raft) AppendEntries(request *AppendEntriesRequest, reply *AppendEntrie
 		lastIndex := rf.getLastLog().Index
 		if lastIndex < request.PrevLogIndex { // the follower's log is too short
 			reply.LastMatchIndex, reply.LastMatchTerm = lastIndex, -1
+			Debug(dLog, "S%v failed to append log entries from S%v, because S%v's log is too short.", rf.me, request.LeaderId, rf.me)
 		} else {
 			// the follower's log with PrevLogIndex is not match the term,
 			// it's term is smaller than the term of leader's log with PrevLogIndex.
 			// Next time, we need to send the log entries from the leader's log with follower's smaller term.
-			reply.LastMatchIndex, reply.LastMatchTerm = -1, rf.logs[request.PrevLogIndex].Term
+			reply.LastMatchTerm = rf.logs[request.PrevLogIndex].Term
+			for i := request.PrevLogIndex; i >= 0; i-- {
+				if rf.logs[i].Term <= request.PrevLogTerm {
+					reply.LastMatchIndex = i
+					break
+				}
+			}
+			Debug(dLog, "S%v failed to append log entries from S%v, because of different term in %v log(S%v's term: %v, S%v's term %v).",
+				rf.me, request.LeaderId, request.PrevLogIndex, rf.me, rf.logs[request.PrevLogIndex].Term, request.LeaderId, request.PrevLogTerm)
 		}
 
 		return
 	}
+
+	isAppend := false
 	for index, entry := range request.Entries {
 		// May be there are some log entries already exist in the follower's log. We don't need to copy it again.
 		if entry.Index >= len(rf.logs) || rf.logs[entry.Index].Term != entry.Term {
 			rf.logs = append(rf.logs[:entry.Index], request.Entries[index:]...)
+			Debug(dLog, "S%v appends log entries(startId: %v, length: %v) from S%v", rf.me, entry.Index, len(request.Entries)-index+1)
+			isAppend = true
 			break
 		}
+	}
+	if !isAppend {
+		Debug(dLog, "S%v received duplicated log entries from S%v", rf.me, request.LeaderId)
 	}
 
 	rf.updateCommitIndexForFollower(request.LeaderCommit)
@@ -573,7 +605,7 @@ func (rf *Raft) updateCommitIndexForFollower(leaderCommit int) {
 	if newCommitIndex > rf.commitIndex {
 		rf.commitIndex = newCommitIndex
 		rf.applyCond.Signal()
-		Debug(dLog, "S%v updates commitIndex to %v", rf.me, rf.commitIndex)
+		Debug(dLog, "S%v updates commitIndex from %v to %v", rf.me, rf.commitIndex, newCommitIndex)
 	}
 }
 
@@ -587,7 +619,6 @@ func (rf *Raft) applier() {
 		commitIndex, lastApplied := rf.commitIndex, rf.lastApplied
 		entries := make([]LogEntry, commitIndex-lastApplied)
 		copy(entries, rf.logs[lastApplied+1:commitIndex+1])
-		Debug(dTest, "S%v commitIndex: %v, lastApplied: %v, entries: %v", rf.me, commitIndex, lastApplied, entries)
 		rf.mu.Unlock()
 
 		for _, entry := range entries {
@@ -606,7 +637,7 @@ func (rf *Raft) applier() {
 }
 
 /**
- * The following code is about the persistent state and snapshots.
+ * The following code is about the persistent state.
  */
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -624,6 +655,17 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	rf.persister.Save(rf.encodeState(), nil)
+}
+
+func (rf *Raft) encodeState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	return w.Bytes()
+
 }
 
 // restore previously persisted state.
@@ -644,8 +686,28 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	var currentTerm int
+	var votedFor int
+	var logs []LogEntry
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+		Debug(dError, "S%v failed to read persist", rf.me)
+	} else {
+		Debug(dInfo, "S%v read persist successfully", rf.me)
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.logs = logs
+		rf.lastApplied = rf.logs[0].Index
+		rf.commitIndex = rf.logs[0].Index
+	}
 }
 
+/**
+* The following code is about the snapshot.
+ */
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)

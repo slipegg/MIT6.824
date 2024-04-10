@@ -1,15 +1,20 @@
 package kvraft
 
 import (
-	"6.5840/labgob"
-	"6.5840/labrpc"
-	"6.5840/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
 )
 
-const Debug = false
+const MaxWaitTime = 600 * time.Millisecond
+
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,15 +23,16 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	*GetArgs
+	*PutAppendArgs
 }
 
 type KVServer struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
@@ -35,15 +41,103 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-}
+	lastApplied int
 
+	kvMachine           KVMachine
+	lastPutAppendId     map[int64]int64
+	notifyChs_PutAppend map[int]chan PutAppendReply
+	notifyChs_Get       map[int]chan GetReply
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	// DPrintf("{KVServer-%d} receives Get %s\n", kv.me, args.Key)
+	defer DPrintf("{KVServer-%d} finishes Get %s, the reply is %v\n", kv.me, args.Key, reply)
+	logId, _, isLeader := kv.rf.Start(Op{GetArgs: args})
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// DPrintf("{KVServer-%d} try to get %s with logId: %d\n", kv.me, args.Key, logId)
+
+	kv.mu.Lock()
+	ch_get := kv.getNotifyCh_Get(logId)
+	kv.mu.Unlock()
+
+	select {
+	case result := <-ch_get:
+		reply.Err = result.Err
+		reply.Value = result.Value
+	case <-time.After(MaxWaitTime):
+		reply.Err = ErrTimeout
+	}
+
+	go func() {
+		kv.mu.Lock()
+		delete(kv.notifyChs_Get, logId)
+		kv.mu.Unlock()
+	}()
+}
+
+func (kv *KVServer) getNotifyCh_Get(id int) chan GetReply {
+	if _, ok := kv.notifyChs_Get[id]; !ok {
+		kv.notifyChs_Get[id] = make(chan GetReply, 1)
+	}
+	return kv.notifyChs_Get[id]
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	defer DPrintf("{KVServer-%d} finishes %s {%s: %s}, the reply is %v\n", kv.me, args.Op, args.Key, args.Value, reply)
+	kv.mu.RLock()
+	if kv.isDuplicate(args.ClientId, args.RequestId) {
+		kv.mu.RUnlock()
+		reply.Err = OK
+		return
+	}
+	kv.mu.RUnlock()
+
+	logId, _, isLeader := kv.rf.Start(Op{PutAppendArgs: args})
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	DPrintf("{KVServer-%d} try to %s {%s: %s} with logId: %d\n", kv.me, args.Op, args.Key, args.Value, logId)
+
+	kv.mu.Lock()
+	ch_putAppend := kv.getNotifyCh_PutAppend(logId)
+	kv.mu.Unlock()
+
+	select {
+	case result := <-ch_putAppend:
+		reply.Err = result.Err
+	case <-time.After(MaxWaitTime):
+		reply.Err = ErrTimeout
+	}
+
+	go func() {
+		kv.mu.Lock()
+		delete(kv.notifyChs_PutAppend, logId)
+		kv.mu.Unlock()
+	}()
+}
+
+func (kv *KVServer) isDuplicate(clientId int64, requestId int64) bool {
+	lastRequestId, ok := kv.lastPutAppendId[clientId]
+	if !ok {
+		return false
+	}
+	return requestId <= lastRequestId
+}
+
+func (kv *KVServer) getNotifyCh_PutAppend(id int) chan PutAppendReply {
+	if _, ok := kv.notifyChs_PutAppend[id]; !ok {
+		kv.notifyChs_PutAppend[id] = make(chan PutAppendReply, 1)
+	}
+	return kv.notifyChs_PutAppend[id]
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -65,6 +159,113 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+func (kv *KVServer) applier() {
+	for !kv.killed() {
+		select {
+		case msg := <-kv.applyCh:
+			if msg.CommandValid {
+				kv.mu.Lock()
+				if msg.CommandIndex <= kv.lastApplied {
+					DPrintf("{KVServer-%d} reveives applied log{%v}", kv.me, msg)
+					kv.mu.Unlock()
+					continue
+				}
+				kv.lastApplied = msg.CommandIndex
+
+				op := msg.Command.(Op)
+				if op.GetArgs != nil {
+					DPrintf("{KVServer-%d} apply get %v.", kv.me, op.GetArgs.Key)
+					value, err := kv.kvMachine.Get(op.GetArgs.Key)
+					reply := GetReply{Err: err, Value: value}
+
+					if currentTerm, isLeader := kv.rf.GetState(); isLeader && currentTerm == msg.CommandTerm {
+						if ch, ok := kv.notifyChs_Get[msg.CommandIndex]; ok {
+							ch <- reply
+						}
+					}
+				} else if op.PutAppendArgs != nil {
+					var reply PutAppendReply
+					if kv.isDuplicate(op.PutAppendArgs.ClientId, op.PutAppendArgs.RequestId) {
+						DPrintf("{KVServer-%d} receives duplicated request{%v}\n", kv.me, msg)
+						reply.Err = OK
+					} else {
+						DPrintf("{KVServer-%d} apply %s {%s: %s}.\n", kv.me, op.PutAppendArgs.Op, op.PutAppendArgs.Key, op.PutAppendArgs.Value)
+						if op.PutAppendArgs.Op == "Put" {
+							reply.Err = kv.kvMachine.Put(op.PutAppendArgs.Key, op.PutAppendArgs.Value)
+						} else if op.PutAppendArgs.Op == "Append" {
+							reply.Err = kv.kvMachine.Append(op.PutAppendArgs.Key, op.PutAppendArgs.Value)
+						}
+						kv.lastPutAppendId[op.PutAppendArgs.ClientId] = op.PutAppendArgs.RequestId
+					}
+
+					if _, isLeader := kv.rf.GetState(); isLeader {
+						if ch, ok := kv.notifyChs_PutAppend[msg.CommandIndex]; ok {
+							ch <- reply
+						}
+					}
+				} else {
+					DPrintf("{KVServer-%d} receives unknown command{%v}", kv.me, msg)
+				}
+
+				if kv.isNeedSnapshot() {
+					DPrintf("{KVServer-%d} needs snapshot\n", kv.me)
+					kv.snapshot(msg.CommandIndex)
+				}
+				kv.mu.Unlock()
+			} else if msg.SnapshotValid {
+				kv.mu.Lock()
+				kv.reloadBySnapshot(msg.Snapshot)
+				kv.lastApplied = msg.CommandIndex
+				kv.mu.Unlock()
+			} else {
+				DPrintf("{KVServer-%d} receives unknown msg{%v}", kv.me, msg)
+			}
+		}
+	}
+}
+
+func (kv *KVServer) isNeedSnapshot() bool {
+	if kv.maxraftstate == -1 {
+		return false
+	}
+	return kv.rf.GetRaftStateSize() > kv.maxraftstate
+}
+
+func (kv *KVServer) snapshot(lastAppliedLogId int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if mr, lr := e.Encode(kv.kvMachine), e.Encode(kv.lastPutAppendId); mr != nil ||
+		lr != nil {
+		DPrintf("{KVServer-%d} snapshot failed. kvMachine length: %v, result: {%v}, lastPutAppendId: {%v}, result: {%v},",
+			kv.me, len(kv.kvMachine.KV), mr, kv.lastPutAppendId, lr)
+		return
+	}
+
+	data := w.Bytes()
+	kv.rf.Snapshot(lastAppliedLogId, data)
+	DPrintf("{KVServer-%d} snapshot succeeded\n", kv.me)
+}
+
+func (kv *KVServer) reloadBySnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+
+	var kvMachine KVMachine
+	var lastPutAppendId map[int64]int64
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&kvMachine) != nil ||
+		d.Decode(&lastPutAppendId) != nil {
+		DPrintf("{KVServer-%d} reloadBySnapshot failed\n", kv.me)
+	}
+
+	DPrintf("{KVServer-%d} reloadBySnapshot succeeded\n", kv.me)
+	kv.lastPutAppendId = lastPutAppendId
+	kv.kvMachine = kvMachine
+}
+
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -82,16 +283,23 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 
-	kv := new(KVServer)
-	kv.me = me
-	kv.maxraftstate = maxraftstate
+	applyCh := make(chan raft.ApplyMsg)
+	kv := &KVServer{
+		me:                  me,
+		applyCh:             applyCh,
+		rf:                  raft.Make(servers, me, persister, applyCh),
+		dead:                0,
+		maxraftstate:        maxraftstate,
+		lastApplied:         0,
+		kvMachine:           *newKVMachine(),
+		lastPutAppendId:     make(map[int64]int64),
+		notifyChs_PutAppend: make(map[int]chan PutAppendReply),
+		notifyChs_Get:       make(map[int]chan GetReply),
+	}
 
-	// You may need initialization code here.
-
-	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
-	// You may need initialization code here.
+	kv.reloadBySnapshot(persister.ReadSnapshot())
+	go kv.applier()
+	DPrintf("{KVServer-%d} started\n", me)
 
 	return kv
 }

@@ -51,3 +51,23 @@ type AppendEntriesReply struct {
 func (reply AppendEntriesReply) String() string {
 	return fmt.Sprintf("{Term:%v,Success:%v,LastMatchIndex:%v,LastMatchTerm:%v}", reply.Term, reply.Success, reply.LastMatchIndex, reply.LastMatchTerm)
 }
+
+type InstallSnapshotRequest struct {
+	Term             int
+	LeaderId         int
+	LastIncludeIndex int
+	LastIncludeTerm  int
+	Data             []byte
+}
+
+func (request InstallSnapshotRequest) String() string {
+	return fmt.Sprintf("{Term:%v,LeaderId:%v,LastIncludeIndex:%v,LastIncludeTerm:%v}", request.Term, request.LeaderId, request.LastIncludeIndex, request.LastIncludeTerm)
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (reply InstallSnapshotReply) String() string {
+	return fmt.Sprintf("{Term:%v}", reply.Term)
+}
